@@ -27,7 +27,7 @@ cfg = _C
 _C.SETTING = "continual"
 
 # Data directory
-_C.DATA_DIR = "./data"
+_C.DATA_DIR = "../test-time-adaptation_V2/data"
 
 # Weight directory
 _C.CKPT_DIR = "./ckpt"
