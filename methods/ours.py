@@ -260,20 +260,25 @@ class Ours(TTAMethod):
                 outputs_ = self.model_t1(self.tta_transform(x)).detach()
                 ema_outputs.append(outputs_)
 
-            # Stack the outputs and calculate entropy for each augmented output
+            # Stack outputs and calculate entropy
             ema_outputs = torch.stack(ema_outputs)  # Shape: [32, batch_size, num_classes]
-            entropies = self.ent(ema_outputs)  # Assuming self.ent takes the stack and returns entropy per sample
+            entropies = self.ent(ema_outputs)       # Calculate entropy across classes
+
+            # Reduce entropy along class dimension to get [32, batch_size] shape
+            entropies = entropies.mean(dim=-1)      # Shape: [32, batch_size]
             
             # Filter by entropy threshold of 0.5
-            filtered_outputs = ema_outputs[entropies < 0.5]
+            mask = entropies < 0.5
+            filtered_outputs = ema_outputs[mask]    # Applies mask to select low-entropy samples
 
             if filtered_outputs.size(0) > 0:
                 outputs_t1 = filtered_outputs.mean(0)  # Mean of filtered samples
             else:
-                outputs_t1 = self.model_t1(x)  # Fallback to the mean of all augmentations if no sample passes threshold
+                outputs_t1 = ema_outputs.mean(0)       # Fallback mean if no sample passes threshold
         else:
             # Create the prediction of the teacher model
             outputs_t1 = self.model_t1(x)
+
 
         
         #outputs_t1 = self.model_t1(x)
