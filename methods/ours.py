@@ -253,15 +253,24 @@ class Ours(TTAMethod):
         # Create the prediction of the anchor (source) model
         anchor_prob = torch.nn.functional.softmax(outputs_s, dim=1).max(1)[0]
 
-        # Augmentation-averaged Prediction
+        # Augmentation-averaged Prediction with entropy filtering
         ema_outputs = []
         if anchor_prob.mean(0) < 0.92:
             for _ in range(32):
                 outputs_ = self.model_t1(self.tta_transform(x)).detach()
                 ema_outputs.append(outputs_)
 
-            # Threshold choice discussed in supplementary
-            outputs_t1 = torch.stack(ema_outputs).mean(0)
+            # Stack the outputs and calculate entropy for each augmented output
+            ema_outputs = torch.stack(ema_outputs)  # Shape: [32, batch_size, num_classes]
+            entropies = self.ent(ema_outputs)  # Assuming self.ent takes the stack and returns entropy per sample
+            
+            # Filter by entropy threshold of 0.5
+            filtered_outputs = ema_outputs[entropies < 0.5]
+
+            if filtered_outputs.size(0) > 0:
+                outputs_t1 = filtered_outputs.mean(0)  # Mean of filtered samples
+            else:
+                outputs_t1 = self.model_t1(x)  # Fallback to the mean of all augmentations if no sample passes threshold
         else:
             # Create the prediction of the teacher model
             outputs_t1 = self.model_t1(x)
