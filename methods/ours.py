@@ -247,8 +247,25 @@ class Ours(TTAMethod):
         x = x[0]
         x_aug = self.tta_transform(x)
 
+        output_source = self.model(x)
+        # Create the prediction of the anchor (source) model
+        anchor_prob = torch.nn.functional.softmax(output_source, dim=1).max(1)[0]
+
+        # Augmentation-averaged Prediction
+        ema_outputs = []
+        if anchor_prob.mean(0) < 0.92:
+            for _ in range(32):
+                outputs_ = self.model_t1(self.tta_transform(x)).detach()
+                ema_outputs.append(outputs_)
+
+            # Threshold choice discussed in supplementary
+            outputs_t1 = torch.stack(ema_outputs).mean(0)
+        else:
+            # Create the prediction of the teacher model
+            outputs_t1 = self.model_t1(x)
+
         outputs_s = self.model_s(x)
-        outputs_t1 = self.model_t1(x)
+        #outputs_t1 = self.model_t1(x)
         outputs_t2 = self.model_t2(x)
         outputs_stu_aug = self.model_s(x_aug)
 
