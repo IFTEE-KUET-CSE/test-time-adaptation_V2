@@ -20,6 +20,8 @@ from utils.losses import (
 )
 
 #iftee version
+#2.0 version
+#final check
 from utils.misc import (
     DomainShiftScheduler,
     compute_prototypes,
