@@ -12,18 +12,12 @@ from models.model import split_up_model
 from utils.losses import (
     Entropy,
     L2SPLoss,
-    MMDLoss,
     RMSNorm,
     SymmetricCrossEntropy,
     differential_loss,
     info_max_loss,
 )
-
-#iftee version
-#2.0 version
-#final check
 from utils.misc import (
-    DomainShiftScheduler,
     compute_prototypes,
     confidence_condition,
     ema_update_model,
@@ -99,7 +93,7 @@ class Ours(TTAMethod):
             self.model_t2, self.arch_name, self.dataset_name
         )
         self.optimizer_backbone_t2 = self.setup_optimizer(
-            self.backbone_t2.parameters(), 0.01
+            self.backbone_t2.parameters(), 0.001
         )
 
         # setup student model
@@ -108,7 +102,7 @@ class Ours(TTAMethod):
             param.detach_()
 
         # configure student model
-        self.configure_model(self.model_s, bn=True)
+        self.configure_model(self.model_s)
         self.params_s, _ = self.collect_params(self.model_s)
         lr = self.cfg.OPTIM.LR
 
@@ -116,6 +110,26 @@ class Ours(TTAMethod):
             self.optimizer_s = self.setup_optimizer(self.params_s, lr)
 
         _ = self.get_number_trainable_params(self.params_s, self.model_s)
+
+        # setup differential loss
+        self.rms_norm = RMSNorm(num_classes, self.device)
+        self.lamda_ = nn.Parameter(
+            torch.zeros(1, dtype=torch.float32, device=self.device, requires_grad=True)
+        )
+        self.lamda_.data.normal_(mean=0, std=0.1)
+
+        self.optimizer_s.add_param_group(
+            {
+                "params": self.rms_norm.parameters(),
+                "lr": self.optimizer_s.param_groups[0]["lr"],
+            }
+        )
+        self.optimizer_s.add_param_group(
+            {
+                "params": self.lamda_,
+                "lr": self.optimizer_s.param_groups[0]["lr"],
+            }
+        )
 
         # setup priority queues for prototype updates
         self.priority_queues = init_pqs(self.num_classes, max_size=10)
@@ -144,19 +158,6 @@ class Ours(TTAMethod):
         self.backbone_s, _ = split_up_model(
             self.model_s, self.arch_name, self.dataset_name
         )
-
-        # keep a feature bank
-        self.feature_bank = None
-
-        # self.scheduler_s = DomainShiftScheduler(
-        #     self.optimizer_s, self.optimizer_s.param_groups[0]["lr"], 0.1, 5
-        # )
-        # self.scheduler_backbone_t2 = DomainShiftScheduler(
-        #     self.optimizer_backbone_t2,
-        #     self.optimizer_backbone_t2.param_groups[0]["lr"],
-        #     0.1,
-        #     5,
-        # )
 
     def prototype_updates(
         self, pqs, num_classes, features, entropies, labels, selected_feature_id
@@ -248,40 +249,7 @@ class Ours(TTAMethod):
         x_aug = self.tta_transform(x)
 
         outputs_s = self.model_s(x)
-
-        outputs_source = self.model(x)
-        # Create the prediction of the anchor (source) model
-        anchor_prob = torch.nn.functional.softmax(outputs_s, dim=1).max(1)[0]
-
-        # Augmentation-averaged Prediction with entropy filtering
-        ema_outputs = []
-        if anchor_prob.mean(0) < 0.92:
-            for _ in range(32):
-                outputs_ = self.model_t1(self.tta_transform(x)).detach()
-                ema_outputs.append(outputs_)
-
-            # Stack outputs and calculate entropy
-            ema_outputs = torch.stack(ema_outputs)  # Shape: [32, batch_size, num_classes]
-            entropies = self.ent(ema_outputs)       # Calculate entropy across classes
-
-            # Reduce entropy along class dimension to get [32, batch_size] shape
-            entropies = entropies.mean(dim=-1)      # Shape: [32, batch_size]
-            
-            # Filter by entropy threshold of 0.5
-            mask = entropies < 0.5
-            filtered_outputs = ema_outputs[mask]    # Applies mask to select low-entropy samples
-
-            if filtered_outputs.size(0) > 0:
-                outputs_t1 = filtered_outputs.mean(0)  # Mean of filtered samples
-            else:
-                outputs_t1 = ema_outputs.mean(0)       # Fallback mean if no sample passes threshold
-        else:
-            # Create the prediction of the teacher model
-            outputs_t1 = self.model_t1(x)
-
-
-        
-        #outputs_t1 = self.model_t1(x)
+        outputs_t1 = self.model_t1(x)
         outputs_t2 = self.model_t2(x)
         outputs_stu_aug = self.model_s(x_aug)
 
@@ -334,11 +302,7 @@ class Ours(TTAMethod):
         )
 
         # final output
-        outputs = torch.nn.functional.softmax(outputs_t1 + outputs_t2, dim=1)
-
-        wandb.log(
-            {"ce_t1_t2": self.symmetric_cross_entropy(outputs_t1, outputs_t2).mean(0)}
-        )
+        outputs = torch.nn.functional.softmax(outputs_s.detach() + outputs_t2, dim=1)
 
         # student model loss
         loss_self_training = 0.0
@@ -388,7 +352,6 @@ class Ours(TTAMethod):
         # calculate the loss for the T2 model
         features_t2 = self.backbone_t2(x)
         features_aug_t2 = self.backbone_t2(x_aug)
-
         cntrs_t2_proto = self.contrastive_loss_proto(
             features_t2, prototypes.detach(), labels_t1, margin=0.5
         )
@@ -400,49 +363,39 @@ class Ours(TTAMethod):
             features_t2, prototypes.detach(), features_aug_t2, labels=None, mask=None
         )
         im_loss = info_max_loss(outputs)
+        loss_differential = differential_loss(
+            outputs_s,
+            outputs_t1.detach(),
+            outputs_t2.detach(),
+            self.lamda_,
+            self.rms_norm,
+        )
 
         loss_t2 = 0.0
         if "contr_t2_proto" in self.cfg.Ours.LOSSES:
-            # loss_t2 += cntrs_t2_proto
+            loss_t2 += cntrs_t2_proto
             wandb.log({"contr_t2_proto": cntrs_t2_proto})
         if "mse_t2_proto" in self.cfg.Ours.LOSSES:
-            # loss_t2 += 10 * mse_t2
-            wandb.log({"mse_t2_proto": 10 * mse_t2})
+            #loss_t2 += 10 * mse_t2
+            wandb.log({"mse_t2_proto": mse_t2})
         if "kld_t2_proto" in self.cfg.Ours.LOSSES:
             # loss_t2 += 100 * kld_t2
-            wandb.log({"kld_t2_proto": 100 * kld_t2})
+            wandb.log({"kld_t2_proto": kld_t2})
         if "contr_t2" in self.cfg.Ours.LOSSES:
             loss_t2 += cntrs_t2
             wandb.log({"contr_t2": cntrs_t2})
         if "im_loss" in self.cfg.Ours.LOSSES:
             loss_t2 += 2 * im_loss
             wandb.log({"im_loss": im_loss})
-
-        features_s = self.backbone_s(x)
-        if self.c == 0:
-            mem_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
-        else:
-            self.ghajini = MMDLoss()
-            mem_loss = self.ghajini(self.feature_bank.detach(), features_s)
-
-        self.feature_bank = features_s
-
         if "l2_sp" in self.cfg.Ours.LOSSES:
             pretrained_weights = self.model_states[0]
             loss_l2_sp = L2SPLoss(pretrained_weights)
             l2_sp = loss_l2_sp(self.model_s)
             loss_stu += l2_sp
             wandb.log({"l2_sp": l2_sp})
-
-        if "mem_loss" in self.cfg.Ours.LOSSES:
-            loss_stu += mem_loss
-            wandb.log({"mem_loss": mem_loss})
-
-        # self.scheduler_s.step(im_loss, threshold=0.8)
-        # self.scheduler_backbone_t2.step(im_loss, threshold=0.8)
-
-        wandb.log({"loss_stu": loss_stu})
-        wandb.log({"loss_t2": loss_t2})
+        if "differ_loss" in self.cfg.Ours.LOSSES:
+            loss_stu += loss_differential
+            wandb.log({"differ_loss": loss_differential})
 
         return outputs, loss_stu, loss_t2
 
@@ -553,6 +506,9 @@ class Ours(TTAMethod):
                     m.running_var = None
             elif isinstance(m, nn.BatchNorm1d):
                 m.train()
+                if bn is None or bn:
+                    m.requires_grad_(True)
+            elif isinstance(m, (nn.LayerNorm, nn.GroupNorm)):
                 if bn is None or bn:
                     m.requires_grad_(True)
             else:
