@@ -35,7 +35,7 @@ def evaluate(description):
     # setup wandb logging
     wandb.run.name = cfg.MODEL.ADAPTATION + "-" + cfg.SETTING + "-" + cfg.CORRUPTION.DATASET
 
-    information = "final one"
+    information = "cyclic on imagenet"
     wandb.run.name += "-" + information
 
     # add current bangladesh time to the run name
@@ -129,61 +129,104 @@ def evaluate(description):
     errs = []
     errs_5 = []
     domain_dict = {}
+    subgroup_avgs = []
+    cycle_avgs_all_subgroups = {1: [], 2: []}  # Dictionary to store each cycle's average error across all subgroups
 
-    # start evaluation
-    for i_dom, domain_name in enumerate(domain_seq_loop):
-        if i_dom == 0 or "reset_each_shift" in cfg.SETTING:
-            try:
-                model.reset()
-                logger.info("resetting model")
-            except AttributeError:
-                logger.warning("not resetting model")
-        else:
-            logger.warning("not resetting model")
+    # Define the domain subgroups
+    subgroups = [
+        range(0, 3),    # Domains 0-2
+        range(3, 7),    # Domains 3-6
+        range(7, 10),   # Domains 7-9
+        range(10, 12),  # Domains 10-11
+        range(12, 15)   # Domains 12-14
+    ]
 
-        for severity in severities:
-            test_data_loader = get_test_loader(
-                setting=cfg.SETTING,
-                adaptation=cfg.MODEL.ADAPTATION,
-                dataset_name=cfg.CORRUPTION.DATASET,
-                preprocess=model_preprocess,
-                data_root_dir=cfg.DATA_DIR,
-                domain_name=domain_name,
-                domain_names_all=domain_sequence,
-                severity=severity,
-                num_examples=cfg.CORRUPTION.NUM_EX,
-                rng_seed=cfg.RNG_SEED,
-                use_clip=cfg.MODEL.USE_CLIP,
-                n_views=cfg.TEST.N_AUGMENTATIONS,
-                delta_dirichlet=cfg.TEST.DELTA_DIRICHLET,
-                batch_size=cfg.TEST.BATCH_SIZE,
-                shuffle=False,
-                workers=min(cfg.TEST.NUM_WORKERS, os.cpu_count())
-            )
+    # Start evaluation over each subgroup
+    for subgroup in subgroups:
+        subgroup_cycle_errs = []  # To store averaged errors for each cycle in the subgroup
 
-            if i_dom == 0:
-                # Note that the input normalization is done inside of the model
-                logger.info(f"Using the following data transformation:\n{test_data_loader.dataset.transform}")
+        # Reset the model parameters at the start of each subgroup
+        try:
+            model.reset()
+            logger.info(f"Resetting model for subgroup {subgroup}")
+        except AttributeError:
+            logger.warning("Model reset not available")
 
-            # evaluate the model
-            acc, domain_dict, num_samples = get_accuracy(
-                model,
-                data_loader=test_data_loader,
-                dataset_name=cfg.CORRUPTION.DATASET,
-                domain_name=domain_name,
-                setting=cfg.SETTING,
-                domain_dict=domain_dict,
-                print_every=cfg.PRINT_EVERY,
-                device=device
-            )
+        for cycle in range(2):  # Perform two cycles per subgroup
+            cycle_errs = []  # To store errors for the current cycle
 
-            err = 1. - acc
-            errs.append(err)
-            if severity == 5 and domain_name != "none":
-                errs_5.append(err)
+            for i_dom in subgroup:
+                domain_name = domain_seq_loop[i_dom]
 
-            logger.info(f"{cfg.CORRUPTION.DATASET} error % [{domain_name}{severity}][#samples={num_samples}]: {err:.2%}")
+                for severity in severities:
+                    test_data_loader = get_test_loader(
+                        setting=cfg.SETTING,
+                        adaptation=cfg.MODEL.ADAPTATION,
+                        dataset_name=cfg.CORRUPTION.DATASET,
+                        preprocess=model_preprocess,
+                        data_root_dir=cfg.DATA_DIR,
+                        domain_name=domain_name,
+                        domain_names_all=domain_sequence,
+                        severity=severity,
+                        num_examples=cfg.CORRUPTION.NUM_EX,
+                        rng_seed=cfg.RNG_SEED,
+                        use_clip=cfg.MODEL.USE_CLIP,
+                        n_views=cfg.TEST.N_AUGMENTATIONS,
+                        delta_dirichlet=cfg.TEST.DELTA_DIRICHLET,
+                        batch_size=cfg.TEST.BATCH_SIZE,
+                        shuffle=False,
+                        workers=min(cfg.TEST.NUM_WORKERS, os.cpu_count())
+                    )
 
+                    if i_dom == subgroup.start:  # First domain in the subgroup
+                        logger.info(f"Using the following data transformation:\n{test_data_loader.dataset.transform}")
+
+                    # Evaluate the model on the current domain and severity level
+                    acc, domain_dict, num_samples = get_accuracy(
+                        model,
+                        data_loader=test_data_loader,
+                        dataset_name=cfg.CORRUPTION.DATASET,
+                        domain_name=domain_name,
+                        setting=cfg.SETTING,
+                        domain_dict=domain_dict,
+                        print_every=cfg.PRINT_EVERY,
+                        device=device
+                    )
+
+                    # Calculate error and store it
+                    err = 1. - acc
+                    errs.append(err)
+                    cycle_errs.append(err)  # Store the error for the current cycle
+                    if severity == 5 and domain_name != "none":
+                        errs_5.append(err)
+
+                    logger.info(f"{cfg.CORRUPTION.DATASET} error % [{domain_name}{severity}][#samples={num_samples}]: {err:.2%}")
+
+            # Calculate and store the average error for the current cycle
+            cycle_avg = sum(cycle_errs) / len(cycle_errs)
+            subgroup_cycle_errs.append(cycle_avg)
+            cycle_avgs_all_subgroups[cycle + 1].append(cycle_avg)  # Store cycle average for all subgroups
+            logger.info(f"Average error for subgroup {subgroup} - cycle {cycle + 1}: {cycle_avg:.2%}")
+
+        # Calculate the average error across both cycles for the current subgroup
+        subgroup_avg = sum(subgroup_cycle_errs) / len(subgroup_cycle_errs)
+        subgroup_avgs.append(subgroup_avg)
+        logger.info(f"Averaged error for subgroup {subgroup} across both cycles: {subgroup_avg:.2%}")
+
+    # Calculate and print the average error for each cycle across all subgroups
+    for cycle, cycle_errors in cycle_avgs_all_subgroups.items():
+        cycle_avg_across_subgroups = sum(cycle_errors) / len(cycle_errors)
+        logger.info(f"Average error across all subgroups - Cycle {cycle}: {cycle_avg_across_subgroups:.2%}")
+
+    # Print the final average error for each subgroup
+    for idx, avg in enumerate(subgroup_avgs):
+        logger.info(f"Final averaged error for Subgroup {idx + 1}: {avg:.2%}")
+
+    # Optionally, calculate the total average error across all subgroups
+    total_avg_error = sum(subgroup_avgs) / len(subgroup_avgs)
+    logger.info(f"Total average error across all subgroups: {total_avg_error:.2%}")
+
+    
     if cfg.SETTING == "continual_mixed_domain":
         i_dom, domain_name = 0, 'mixed'
 
