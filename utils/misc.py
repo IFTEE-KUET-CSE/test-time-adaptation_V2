@@ -266,3 +266,4 @@ class DomainShiftScheduler(object):
                 self.optimizer.param_groups[0]["lr"] = self.initial_lr
 
         self.prev_im_loss = im_loss
+
